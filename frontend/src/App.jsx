@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
+const API = "https://ai-interview-pro-ldry.onrender.com";
 
 const DURATIONS = [
   { value: 15, label: "15 min", description: "Quick interview" },
