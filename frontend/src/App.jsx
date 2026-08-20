@@ -19,6 +19,9 @@ function App() {
   const mediaRecorderRef = useRef(null);
   const recordingChunksRef = useRef([]);
   const interviewActiveRef = useRef(false);
+  const timerEndRef = useRef(null);
+  const endInterviewRef = useRef(null);
+  const endingInterviewRef = useRef(false);
 
   const [resumeFile, setResumeFile] = useState(null);
   const [resumeId, setResumeId] = useState(null);
@@ -585,12 +588,16 @@ function App() {
 
       setInterviewId(id);
       interviewActiveRef.current = true;
+      endingInterviewRef.current = false;
+
+      timerEndRef.current =
+        Date.now() + duration * 60 * 1000;
+
+      setTimeLeft(duration * 60);
 
       setInterviewStarted(true);
       await requestInterviewFullscreen();
       startRecording();
-
-      setTimeLeft(duration * 60);
 
       setScore(null);
       setReport(null);
@@ -761,27 +768,34 @@ function App() {
       window.speechSynthesis.cancel();
     }
 
+    // Stop camera + microphone immediately.
     if (cameraStreamRef.current) {
       cameraStreamRef.current
         .getTracks()
         .forEach((track) => {
-          track.stop();
+          try {
+            track.stop();
+          } catch {}
         });
 
       cameraStreamRef.current = null;
     }
 
+    // Stop screen sharing immediately.
     if (screenStreamRef.current) {
       screenStreamRef.current
         .getTracks()
         .forEach((track) => {
-          track.stop();
+          try {
+            track.stop();
+          } catch {}
         });
 
       screenStreamRef.current = null;
     }
 
     if (videoRef.current) {
+      videoRef.current.pause?.();
       videoRef.current.srcObject = null;
     }
 
@@ -795,13 +809,21 @@ function App() {
   // ------------------------------------------------------------
 
   async function endInterview(autoEnded = false) {
+    // Prevent double calls from timer + fullscreen/tab handlers/buttons.
+    if (endingInterviewRef.current) {
+      return;
+    }
+
     if (!interviewStarted && !interviewActiveRef.current) {
       stopAllMedia();
+      timerEndRef.current = null;
       await exitInterviewFullscreen();
       return;
     }
 
+    endingInterviewRef.current = true;
     interviewActiveRef.current = false;
+
     stopListening();
 
     if ("speechSynthesis" in window) {
@@ -814,19 +836,42 @@ function App() {
         : "Ending interview..."
     );
 
+    // Hide the live interview immediately.
     setInterviewStarted(false);
+    timerEndRef.current = null;
 
     const id = Number(interviewId);
 
+    // Stop the MediaRecorder and prepare its upload promise.
+    // We stop all camera/mic/screen tracks immediately below.
+    let recordingPromise = Promise.resolve(null);
+
+    if (id && mediaRecorderRef.current) {
+      recordingPromise =
+        stopRecordingAndUpload(id).catch(
+          (recordingError) => {
+            console.error(
+              "RECORDING UPLOAD ERROR:",
+              recordingError
+            );
+
+            addEvent(
+              "Recording could not be uploaded.",
+              "danger"
+            );
+
+            return null;
+          }
+        );
+    }
+
+    // IMPORTANT: turn OFF camera, microphone and screen NOW.
+    // Do not wait for recording upload or report generation.
+    stopAllMedia();
+
     try {
-      // Save the recording BEFORE finalizing the interview.
       if (id) {
-        try {
-          await stopRecordingAndUpload(id);
-        } catch (recordingError) {
-          console.error("RECORDING UPLOAD ERROR:", recordingError);
-          addEvent("Recording could not be uploaded.", "danger");
-        }
+        await recordingPromise;
 
         const response = await fetch(
           `${API}/end-interview`,
@@ -847,10 +892,13 @@ function App() {
           `${API}/report/${id}`
         );
 
-        const reportData = await readResponse(reportResponse);
+        const reportData =
+          await readResponse(reportResponse);
 
         setReport(reportData);
-        setScore(Number(reportData.average_score ?? 0));
+        setScore(
+          Number(reportData.average_score ?? 0)
+        );
 
         addEvent(
           "Interview result saved.",
@@ -858,7 +906,10 @@ function App() {
         );
       }
     } catch (err) {
-      console.error("END INTERVIEW ERROR:", err);
+      console.error(
+        "END INTERVIEW ERROR:",
+        err
+      );
 
       setError(
         `Interview ended, but report could not be loaded: ${getErrorMessage(err)}`
@@ -869,9 +920,71 @@ function App() {
 
       setQuestion("");
       setAnswer("");
+      setTimeLeft(0);
       setStatus("Interview ended");
+
+      endingInterviewRef.current = false;
     }
   }
+
+  // ------------------------------------------------------------
+  // Interview countdown timer
+  // ------------------------------------------------------------
+
+  endInterviewRef.current = endInterview;
+
+  useEffect(() => {
+    if (!interviewStarted) {
+      return;
+    }
+
+    if (!timerEndRef.current) {
+      timerEndRef.current =
+        Date.now() + timeLeft * 1000;
+    }
+
+    let intervalId = null;
+
+    const updateTimer = () => {
+      if (!timerEndRef.current) {
+        return;
+      }
+
+      const remaining = Math.max(
+        0,
+        Math.ceil(
+          (timerEndRef.current - Date.now()) / 1000
+        )
+      );
+
+      setTimeLeft(remaining);
+
+      if (remaining <= 0) {
+        if (intervalId !== null) {
+          window.clearInterval(intervalId);
+        }
+
+        if (
+          endInterviewRef.current &&
+          !endingInterviewRef.current
+        ) {
+          endInterviewRef.current(true);
+        }
+      }
+    };
+
+    updateTimer();
+    intervalId = window.setInterval(
+      updateTimer,
+      1000
+    );
+
+    return () => {
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
+    };
+  }, [interviewStarted]);
 
   // ------------------------------------------------------------
   // Anti-cheating monitoring
@@ -989,14 +1102,22 @@ useEffect(() => {
 
   useEffect(() => {
     const cleanup = () => {
+      endingInterviewRef.current = true;
+      interviewActiveRef.current = false;
+      timerEndRef.current = null;
+
       if (mediaRecorderRef.current) {
         try {
-          if (mediaRecorderRef.current.state !== "inactive") {
+          if (
+            mediaRecorderRef.current.state !==
+            "inactive"
+          ) {
             mediaRecorderRef.current.stop();
           }
         } catch {}
         mediaRecorderRef.current = null;
       }
+
       stopAllMedia();
     };
 
@@ -1057,6 +1178,9 @@ useEffect(() => {
 
     setStatus("Ready");
     setError("");
+
+    timerEndRef.current = null;
+    endingInterviewRef.current = false;
 
     setTimeLeft(duration * 60);
   }
